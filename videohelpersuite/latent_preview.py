@@ -1,3 +1,6 @@
+import os
+import subprocess
+
 from PIL import Image
 import time
 import io
@@ -5,6 +8,11 @@ import struct
 from threading import Thread
 import torch.nn.functional as F
 import torch
+
+import folder_paths
+import numpy as np
+import cv2
+import shutil
 
 import latent_preview
 import server
@@ -30,12 +38,14 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
         else:
             raise Exception('Unsupported preview type for VHS animated previews')
 
-    def decode_latent_to_preview_image(self, preview_format, x0):
+    def decode_latent_to_preview_image(self, preview_format, x0, step):
+        print(f"ndim: {x0.ndim}, shape: {x0.shape}")
         if x0.ndim == 5:
-            #Keep batch major
-            x0 = x0.movedim(2,1)
-            x0 = x0.reshape((-1,)+x0.shape[-3:])
-        num_images = x0.size(0)
+            num_images = (x0.size(2) - 1) * 4 + x0.size(0) # account for 4x temporal upsampling and batch size
+
+        else:
+            num_images = x0.size(0)
+
         new_time = time.time()
         num_previews = int((new_time - self.last_time) * self.rate)
         self.last_time = self.last_time + num_previews/self.rate
@@ -47,16 +57,32 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
             self.first_preview = False
             serv.send_sync('VHS_latentpreview', {'length':num_images, 'rate': self.rate, 'id': serv.last_node_id})
             self.last_time = new_time + 1/self.rate
+
         if self.c_index + num_previews > num_images:
-            x0 = x0.roll(-self.c_index, 0)[:num_previews]
+            if x0.ndim == 5:
+                x0 = x0.roll(-self.c_index, 1)[:,:num_previews]
+            else:
+                x0 = x0.roll(-self.c_index, 0)[:num_previews]
         else:
-            x0 = x0[self.c_index:self.c_index + num_previews]
+            if x0.ndim == 5:
+                x0 = x0[:,self.c_index:self.c_index + num_previews]
+            else:
+                x0 = x0[self.c_index:self.c_index + num_previews]
+
         Thread(target=self.process_previews, args=(x0, self.c_index,
-                                                   num_images)).run()
+                                                   num_images, step)).run()
         self.c_index = (self.c_index + num_previews) % num_images
         return None
-    def process_previews(self, image_tensor, ind, leng):
+    
+    def process_previews(self, image_tensor, ind, leng, step):
         image_tensor = self.decode_latent_to_preview(image_tensor)
+
+        if image_tensor.ndim == 5:
+            # (B, H, W, T, C) → (B*T, H, W, C)
+            B, H, W, T, C = image_tensor.shape
+            image_tensor = image_tensor.permute(0, 3, 1, 2, 4)  # (B, T, H, W, C)
+            image_tensor = image_tensor.reshape(B*T, H, W, C)
+
         if image_tensor.size(1) > 512 or image_tensor.size(2) > 512:
             image_tensor = image_tensor.movedim(-1,0)
             if image_tensor.size(2) < image_tensor.size(3):
@@ -69,6 +95,8 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
         previews_ubyte = (((image_tensor + 1.0) / 2.0).clamp(0, 1)  # change scale from -1..1 to 0..1
                          .mul(0xFF)  # to 0..255
                          ).to(device="cpu", dtype=torch.uint8)
+
+        img_id = 0
         for preview in previews_ubyte:
             i = Image.fromarray(preview.numpy())
             message = io.BytesIO()
@@ -77,9 +105,65 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
             message.write(struct.pack('16p', serv.last_node_id.encode('ascii')))
             i.save(message, format="JPEG", quality=95, compress_level=1)
             #NOTE: send sync already uses call_soon_threadsafe
+
             serv.send_sync(server.BinaryEventTypes.PREVIEW_IMAGE,
                            message.getvalue(), serv.client_id)
             ind = (ind + 1) % leng
+
+        self.save_preview_video(previews_ubyte, step)
+
+        
+    def save_preview_video(self, previews_ubyte, step):
+        # Save as video via ffmpeg, overwriting each step
+        video_dir = os.path.join(folder_paths.get_output_directory(), "previews")
+        os.makedirs(video_dir, exist_ok=True)
+        current_video_files = [f for f in os.listdir(video_dir) if f.startswith(f"preview") and f.endswith(".mp4")]
+        
+        video_name = "preview.mp4"
+        
+        if len(current_video_files) > 0:
+            # sort by modification time, newest first
+            current_video_files.sort(key=lambda f: os.path.getmtime(os.path.join(video_dir, f)), reverse=True)
+            _, prev_counter, prev_step = os.path.splitext(current_video_files[0])[0].split("_")
+
+            if step == int(prev_step) + 1:
+                # remove the existing video to overwrite it
+                os.remove(os.path.join(video_dir, current_video_files[0]))
+                video_name = f"preview_{prev_counter}_{step}.mp4"
+            else:
+                video_name = f"preview_{int(prev_counter)+1}_{step}.mp4"
+
+        else:
+            video_name = f"preview_1_{step}.mp4"
+
+        video_path = os.path.join(video_dir, video_name)
+
+        h, w = previews_ubyte.shape[1], previews_ubyte.shape[2]
+        w = w if w % 2 == 0 else w - 1
+        h = h if h % 2 == 0 else h - 1
+        previews_ubyte = previews_ubyte[:, :h, :w, :]
+
+        ffmpeg_command = [
+            "ffmpeg", "-y",
+            "-f", "rawvideo",
+            "-vcodec", "rawvideo",
+            "-s", f"{w}x{h}",
+            "-pix_fmt", "rgb24",
+            "-r", "15",
+            "-i", "pipe:0",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            video_path
+        ]
+
+        proc = subprocess.Popen(ffmpeg_command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for frame in previews_ubyte:
+            proc.stdin.write(frame.numpy().tobytes())
+        proc.stdin.close()
+        proc.wait()
+
     def decode_latent_to_preview(self, x0):
         if hasattr(self, 'taesd'):
             x_sample = self.taesd.decode(x0).movedim(1, 3)

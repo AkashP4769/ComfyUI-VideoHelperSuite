@@ -2541,6 +2541,7 @@ api.addEventListener('VHS_latentpreview', ({ detail }) => {
     previewImages.length = detail.length
 
     let idParts = detail.id.split(':')
+
     for (let i=1; i <= idParts.length; i++) {
         let id = idParts.slice(0,i).join(':')
         beginLatentPreview(id, previewImages, detail.rate)
