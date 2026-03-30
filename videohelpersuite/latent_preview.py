@@ -37,8 +37,49 @@ class WrappedPreviewer(latent_preview.LatentPreviewer):
             self.latent_rgb_factors_reshape = getattr(previewer, 'latent_rgb_factors_reshape', None)
         else:
             raise Exception('Unsupported preview type for VHS animated previews')
-
+        
     def decode_latent_to_preview_image(self, preview_format, x0, step):
+        try:
+            self.decode_latent_to_preview_image_new(preview_format, x0, step)
+        except Exception as e:
+            print(f"Error in decode_latent_to_preview_image_new: {e}")
+            try:
+                self.decode_latent_to_preview_image_old(preview_format, x0, step)
+            except Exception as e:
+                print(f"Error in decode_latent_to_preview_image_old: {e}")
+                print("Both new and old preview methods failed, skipping preview update.")
+
+        finally:
+            return None
+                
+
+    def decode_latent_to_preview_image_old(self, preview_format, x0, step):
+        if x0.ndim == 5:
+            #Keep batch major
+            x0 = x0.movedim(2,1)
+            x0 = x0.reshape((-1,)+x0.shape[-3:])
+        num_images = x0.size(0)
+        new_time = time.time()
+        num_previews = int((new_time - self.last_time) * self.rate)
+        self.last_time = self.last_time + num_previews/self.rate
+        if num_previews > num_images:
+            num_previews = num_images
+        elif num_previews <= 0:
+            return None
+        if self.first_preview:
+            self.first_preview = False
+            serv.send_sync('VHS_latentpreview', {'length':num_images, 'rate': self.rate, 'id': serv.last_node_id})
+            self.last_time = new_time + 1/self.rate
+        if self.c_index + num_previews > num_images:
+            x0 = x0.roll(-self.c_index, 0)[:num_previews]
+        else:
+            x0 = x0[self.c_index:self.c_index + num_previews]
+        Thread(target=self.process_previews, args=(x0, self.c_index,
+                                                   num_images, step)).run()
+        self.c_index = (self.c_index + num_previews) % num_images
+        return None
+
+    def decode_latent_to_preview_image_new(self, preview_format, x0, step):
         print(f"ndim: {x0.ndim}, shape: {x0.shape}")
         if x0.ndim == 5:
             num_images = (x0.size(2) - 1) * 4 + x0.size(0) # account for 4x temporal upsampling and batch size
